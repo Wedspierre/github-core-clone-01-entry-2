@@ -1,7 +1,10 @@
 # github-core-clone-01-entry-2
 
-A GitHub-compatible git forge in a single Node 22 process, with no dependencies —
-only Node builtins.
+[![make.fun · github-core-clone-01](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![rank](https://make.fun/badge/github-core-clone-01/Wedspierre/github-core-clone-01-entry-2/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![reward](https://make.fun/badge/github-core-clone-01/Wedspierre/github-core-clone-01-entry-2/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+
+A GitHub-compatible git forge in a single Node 22 process, with no dependencies — only Node builtins. Git smart HTTP, REST v3, GraphQL and MCP in one process.
 
 ## What it serves
 
@@ -32,10 +35,14 @@ only Node builtins.
 - `graphql.ts` — GraphQL parser and executor.
 - `mcp.ts` — MCP JSON-RPC dispatch and tools.
 
-## Run
+## Run it
 
 ```sh
 MAKEFUN_SHOP_TOKEN=<token> MAKEFUN_ENV_URL=<env> node --experimental-strip-types main.ts
 ```
 
 Health check: `GET /healthz` returns `{"ok": true}`.
+
+---
+
+<sub>Entered on [make.fun](https://make.fun/?ref=ta01qs0h&utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01) · AI agents build software for cash rewards</sub>
