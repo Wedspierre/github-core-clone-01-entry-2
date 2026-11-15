@@ -41,7 +41,7 @@ const CODE_TYPE: Record<number, ObjectType> = { 1: 'commit', 2: 'tree', 3: 'blob
 export function hashObject(type: ObjectType, data: Buffer | Uint8Array): string {
   const body = Buffer.isBuffer(data) ? data : Buffer.from(data);
   const hash = createHash('sha1');
-  hash.update(Buffer.from(`${type} ${body.length}\0`, 'utf8'));
+  hash.update(`${type} ${body.length}\0`);
   hash.update(body);
   return hash.digest('hex');
 }
@@ -147,6 +147,33 @@ export function buildCommit(tree: string, parents: string[], message: string, wh
 /** Build an annotated tag object's bytes. */
 export function buildTag(object: string, type: string, tag: string, message: string, who: string, timestamp: number): Buffer {
   return Buffer.from(`object ${object}\ntype ${type}\ntag ${tag}\ntagger ${who} ${timestamp} +0000\n\n${message}`, 'utf8');
+}
+
+// ---------------------------------------------------------------------------------------------
+// cached parses: git objects are immutable once stored, so a commit/tree parsed once for a
+// repository stays valid for the repository's whole life. The hot paths (push fast-forward
+// checks, fetch planning, tree flattening) parse the same commits and trees over and over;
+// these accessors parse at most once per oid.
+// ---------------------------------------------------------------------------------------------
+
+export function commitOf(repo: Repo, oid: string): CommitView | undefined {
+  const cached = repo.commitCache.get(oid);
+  if (cached !== undefined) return cached;
+  const object = repo.objects.get(oid);
+  if (object === undefined || object.type !== 'commit') return undefined;
+  const parsed = parseCommit(object.data);
+  repo.commitCache.set(oid, parsed);
+  return parsed;
+}
+
+export function treeOf(repo: Repo, oid: string): TreeEntry[] | undefined {
+  const cached = repo.treeCache.get(oid);
+  if (cached !== undefined) return cached;
+  const object = repo.objects.get(oid);
+  if (object === undefined || object.type !== 'tree') return undefined;
+  const parsed = parseTree(object.data);
+  repo.treeCache.set(oid, parsed);
+  return parsed;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -345,7 +372,8 @@ function writePackObjectHeader(type: ObjectType, size: number): Buffer {
   return Buffer.from(bytes);
 }
 
-/** Write a packfile (version 2, no deltas) holding the given objects. */
+/** Write a packfile (version 2, no deltas) holding the given objects. Deflate level 1:
+ *  the wire is loopback, so bytes are cheap and CPU is the scarce resource. */
 export function writePack(objects: Iterable<GitObject>): Buffer {
   const list = [...objects];
   const header = Buffer.alloc(12);
@@ -355,7 +383,7 @@ export function writePack(objects: Iterable<GitObject>): Buffer {
   const parts: Buffer[] = [header];
   for (const object of list) {
     parts.push(writePackObjectHeader(object.type, object.data.length));
-    parts.push(deflateSync(object.data));
+    parts.push(deflateSync(object.data, { level: 1 }));
   }
   const body = Buffer.concat(parts);
   const trailer = createHash('sha1').update(body).digest();
@@ -395,18 +423,20 @@ export function collectReachable(
   return seen;
 }
 
-/** Flatten a tree (recursively) into path -> blob oid. */
+/** Flatten a tree (recursively) into path -> blob oid. Pass `repo` to reuse its parse cache. */
 export function flattenTree(
   treeOid: string,
   lookup: (oid: string) => GitObject | undefined,
   prefix = '',
   out: Map<string, string> = new Map(),
+  repo?: Repo,
 ): Map<string, string> {
   const object = lookup(treeOid);
   if (!object || object.type !== 'tree') return out;
-  for (const entry of parseTree(object.data)) {
+  const entries = repo === undefined ? parseTree(object.data) : (treeOf(repo, treeOid) ?? parseTree(object.data));
+  for (const entry of entries) {
     const path = prefix === '' ? entry.name : `${prefix}/${entry.name}`;
-    if (entry.mode === '40000') flattenTree(entry.oid, lookup, path, out);
+    if (entry.mode === '40000') flattenTree(entry.oid, lookup, path, out, repo);
     else if (entry.mode !== '160000') out.set(path, entry.oid);
   }
   return out;
@@ -478,6 +508,10 @@ export interface Issue {
   createdAt: string;
   updatedAt: string;
   seq: number;
+  /** Precomputed node_id (never changes for an issue). */
+  nodeId: string;
+  /** Cached serialised REST JSON for this issue; null when stale (set on any mutation). */
+  jsonCache: Buffer | null;
 }
 
 export interface Comment {
@@ -528,6 +562,12 @@ export interface Repo {
   createdAt: string;
   updatedAt: string;
   seq: number;
+  /** Parsed commits by oid (objects are immutable; see commitOf). */
+  commitCache: Map<string, CommitView>;
+  /** Parsed trees by oid (see treeOf). */
+  treeCache: Map<string, TreeEntry[]>;
+  /** Cached git fetch responses, keyed by wants/deepen/filter + object count (see gitproto). */
+  fetchCache: Map<string, Buffer>;
 }
 
 /** Deterministic time: a base instant plus one second per stamp handed out. */
@@ -593,6 +633,9 @@ export class Store {
       createdAt: now,
       updatedAt: now,
       seq: this.nextGlobalId++,
+      commitCache: new Map(),
+      treeCache: new Map(),
+      fetchCache: new Map(),
     };
     this.repos.set(this.repoKey(repo.owner, name), repo);
     this.repoList.push(repo);
@@ -630,10 +673,10 @@ export class Store {
   /** Record a commit's generation, from its parents' generations. */
   noteCommit(repo: Repo, oid: string): void {
     if (repo.depth.has(oid)) return;
-    const object = repo.objects.get(oid);
-    if (!object || object.type !== 'commit') return;
+    const commit = commitOf(repo, oid);
+    if (!commit) return;
     let depth = 0;
-    for (const parent of parseCommit(object.data).parents) {
+    for (const parent of commit.parents) {
       this.noteCommit(repo, parent);
       depth = Math.max(depth, (repo.depth.get(parent) ?? 0) + 1);
     }
@@ -649,10 +692,8 @@ export class Store {
     let current = oid;
     let steps = oDepth - aDepth;
     while (steps > 0) {
-      const object = repo.objects.get(current);
-      if (!object || object.type !== 'commit') return false;
-      const parents = parseCommit(object.data).parents;
-      if (parents.length === 0) return false;
+      const parents = commitOf(repo, current)?.parents;
+      if (!parents || parents.length === 0) return false;
       current = parents[0]!;
       steps -= 1;
       if (current === ancestor) return true;
@@ -663,9 +704,9 @@ export class Store {
     const queue = [oid];
     while (queue.length > 0) {
       const next = queue.pop()!;
-      const object = repo.objects.get(next);
-      if (!object || object.type !== 'commit') continue;
-      for (const parent of parseCommit(object.data).parents) {
+      const parents = commitOf(repo, next)?.parents;
+      if (!parents) continue;
+      for (const parent of parents) {
         if (parent === ancestor) return true;
         if (!seen.has(parent)) {
           seen.add(parent);
@@ -693,8 +734,8 @@ export class Store {
     const tip = this.branchTip(repo, branch);
     const files = new Map<string, string>();
     if (tip !== undefined) {
-      const commit = parseCommit(repo.objects.get(tip)!.data);
-      for (const [filePath, oid] of flattenTree(commit.tree, (oid) => repo.objects.get(oid))) files.set(filePath, oid);
+      const commit = commitOf(repo, tip)!;
+      for (const [filePath, oid] of flattenTree(commit.tree, (oid) => repo.objects.get(oid), '', new Map(), repo)) files.set(filePath, oid);
     }
     files.set(path, blobSha);
     const treeSha = buildTreeFromFiles(files, (type, data) => this.putObject(repo, type, data));
@@ -711,8 +752,8 @@ export class Store {
   deleteFile(repo: Repo, branch: string, path: string, message: string): string | null {
     const tip = this.branchTip(repo, branch);
     if (tip === undefined) return null;
-    const commit = parseCommit(repo.objects.get(tip)!.data);
-    const files = flattenTree(commit.tree, (oid) => repo.objects.get(oid));
+    const commit = commitOf(repo, tip)!;
+    const files = flattenTree(commit.tree, (oid) => repo.objects.get(oid), '', new Map(), repo);
     if (!files.has(path)) return null;
     files.delete(path);
     const treeSha = buildTreeFromFiles(files, (type, data) => this.putObject(repo, type, data));
@@ -734,19 +775,20 @@ export class Store {
       const oid = queue.shift()!;
       if (seen.has(oid)) continue;
       seen.add(oid);
-      const object = repo.objects.get(oid);
-      if (!object || object.type !== 'commit') continue;
+      const commit = commitOf(repo, oid);
+      if (!commit) continue;
       out.push(oid);
-      for (const parent of parseCommit(object.data).parents) queue.push(parent);
+      for (const parent of commit.parents) queue.push(parent);
     }
     return out;
   }
 
   createIssue(repo: Repo, title: string, body: string, labels: Label[]): Issue {
     const now = this.clock.stamp();
+    const number = repo.nextNumber++;
     const issue: Issue = {
-      id: repo.id * 1000000 + repo.nextNumber,
-      number: repo.nextNumber++,
+      id: repo.id * 1000000 + number,
+      number,
       title,
       body,
       state: 'open',
@@ -754,6 +796,8 @@ export class Store {
       createdAt: now,
       updatedAt: now,
       seq: this.nextGlobalId++,
+      nodeId: Buffer.from(`issue:${repo.id}:${number}`, 'utf8').toString('base64url'),
+      jsonCache: null,
     };
     repo.issues.push(issue);
     repo.issuesByNumber.set(issue.number, issue);
@@ -761,6 +805,8 @@ export class Store {
   }
 
   addComment(repo: Repo, issueNumber: number, body: string): Comment {
+    const issue = repo.issuesByNumber.get(issueNumber);
+    if (issue) issue.jsonCache = null;
     const comment: Comment = { id: repo.nextCommentId++, body, createdAt: this.clock.stamp(), seq: this.nextGlobalId++ };
     const list = repo.comments.get(issueNumber) ?? [];
     list.push(comment);
@@ -794,10 +840,10 @@ export class Store {
 
   /** The files changed between the base tip and the head tip of a pull request. */
   pullFiles(repo: Repo, pull: PullRequest): Array<{ filename: string; status: string; additions: number; deletions: number; changes: number }> {
-    const baseCommit = repo.objects.get(pull.baseSha);
-    const headCommit = repo.objects.get(pull.headSha);
-    const baseFiles = baseCommit ? flattenTree(parseCommit(baseCommit.data).tree, (oid) => repo.objects.get(oid)) : new Map<string, string>();
-    const headFiles = headCommit ? flattenTree(parseCommit(headCommit.data).tree, (oid) => repo.objects.get(oid)) : new Map<string, string>();
+    const baseCommit = commitOf(repo, pull.baseSha);
+    const headCommit = commitOf(repo, pull.headSha);
+    const baseFiles = baseCommit ? flattenTree(baseCommit.tree, (oid) => repo.objects.get(oid), '', new Map(), repo) : new Map<string, string>();
+    const headFiles = headCommit ? flattenTree(headCommit.tree, (oid) => repo.objects.get(oid), '', new Map(), repo) : new Map<string, string>();
     const out: Array<{ filename: string; status: string; additions: number; deletions: number; changes: number }> = [];
     const paths = new Set([...baseFiles.keys(), ...headFiles.keys()]);
     for (const path of [...paths].sort()) {
@@ -820,16 +866,16 @@ export class Store {
 
   /** True when merging `pull` would conflict with the default branch's current tip. */
   pullConflicts(repo: Repo, pull: PullRequest): boolean {
-    const baseCommit = repo.objects.get(pull.baseSha);
-    const headCommit = repo.objects.get(pull.headSha);
+    const baseCommit = commitOf(repo, pull.baseSha);
+    const headCommit = commitOf(repo, pull.headSha);
     const defaultTip = this.branchTip(repo, pull.baseRef);
     if (!baseCommit || !headCommit || defaultTip === undefined) return false;
     if (defaultTip === pull.baseSha) return false;
-    const defaultCommit = repo.objects.get(defaultTip);
+    const defaultCommit = commitOf(repo, defaultTip);
     if (!defaultCommit) return false;
-    const baseFiles = flattenTree(parseCommit(baseCommit.data).tree, (oid) => repo.objects.get(oid));
-    const headFiles = flattenTree(parseCommit(headCommit.data).tree, (oid) => repo.objects.get(oid));
-    const defaultFiles = flattenTree(parseCommit(defaultCommit.data).tree, (oid) => repo.objects.get(oid));
+    const baseFiles = flattenTree(baseCommit.tree, (oid) => repo.objects.get(oid), '', new Map(), repo);
+    const headFiles = flattenTree(headCommit.tree, (oid) => repo.objects.get(oid), '', new Map(), repo);
+    const defaultFiles = flattenTree(defaultCommit.tree, (oid) => repo.objects.get(oid), '', new Map(), repo);
     const paths = new Set([...baseFiles.keys(), ...headFiles.keys()]);
     for (const path of paths) {
       const bv = baseFiles.get(path);
@@ -847,9 +893,9 @@ export class Store {
     if (this.pullConflicts(repo, pull)) return null;
     const baseTip = this.branchTip(repo, pull.baseRef);
     if (baseTip === undefined) return null;
-    const headCommit = repo.objects.get(pull.headSha);
+    const headCommit = commitOf(repo, pull.headSha);
     if (!headCommit) return null;
-    const tree = parseCommit(headCommit.data).tree;
+    const tree = headCommit.tree;
     const who = `${VIEWER.name} <${VIEWER.email}>`;
     const message = `Merge pull request #${pull.number} from ${pull.headRef}\n\n${pull.title}\n`;
     const commitData = buildCommit(tree, [baseTip], message, who, this.clock.stampSec());

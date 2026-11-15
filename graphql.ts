@@ -886,6 +886,7 @@ function resolveMutation(selection: GqlSelection, ctx: ExecCtx): unknown {
     if (!repo || !issue) throw new GqlError('Issue not found');
     issue.state = 'closed';
     issue.updatedAt = ctx.store.clock.stamp();
+    issue.jsonCache = null;
     const issueNode = selectFields('Issue', { __type: 'issue', repo, number: issue.number }, selection.children.find((child) => child.name === 'issue')?.children ?? [], ctx);
     return { issue: issueNode };
   }

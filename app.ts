@@ -24,6 +24,16 @@ import { handleMcpBody } from './mcp.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 
+/** True when `text` is a non-empty run of ASCII digits (a REST issue/pull number). */
+function isDigits(text: string): boolean {
+  if (text === '') return false;
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index);
+    if (code < 48 || code > 57) return false;
+  }
+  return true;
+}
+
 export function createApp(store: Store): Server {
   let requestCounter = 0;
 
@@ -84,10 +94,10 @@ export function createApp(store: Store): Server {
   function authorized(req: IncomingMessage): boolean {
     const expected = process.env.MAKEFUN_SHOP_TOKEN ?? '';
     const header = req.headers.authorization ?? '';
-    const match = /^Bearer (.+)$/.exec(header);
-    if (match === null) return false;
-    if (expected === '') return match[1]!.length > 0;
-    return match[1] === expected;
+    if (!header.startsWith('Bearer ')) return false;
+    const token = header.slice(7);
+    if (expected === '') return token.length > 0;
+    return token === expected;
   }
 
   async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -103,10 +113,21 @@ export function createApp(store: Store): Server {
     }
 
     // --- git smart HTTP ---
-    const gitMatch = /^\/([^/]+)\/([^/]+)\.git\/(.+)$/.exec(path);
-    if (gitMatch !== null) {
-      await handleGit(req, res, gitMatch[1]!, gitMatch[2]!, gitMatch[3]!, url);
-      return;
+    // /<owner>/<repo>.git/<suffix>, parsed by hand: the regex this replaced ran on
+    // every git request, and push/clone workloads issue hundreds of them.
+    const gitIdx = path.lastIndexOf('.git/');
+    if (gitIdx > 1) {
+      const prefix = path.slice(1, gitIdx);
+      const slash = prefix.indexOf('/');
+      if (slash > 0 && prefix.indexOf('/', slash + 1) < 0) {
+        const owner = prefix.slice(0, slash);
+        const repoName = prefix.slice(slash + 1);
+        const suffix = path.slice(gitIdx + 5);
+        if (owner !== '' && repoName !== '' && suffix !== '') {
+          await handleGit(req, res, owner, repoName, suffix, url);
+          return;
+        }
+      }
     }
 
     // --- API surface: everything below needs a valid token ---
@@ -275,141 +296,168 @@ export function createApp(store: Store): Server {
         }
       }
 
-      // /repos/:owner/:repo/...
-      const repoMatch = /^\/repos\/([^/]+)\/([^/]+)(?:\/(.*))?$/.exec(tail);
-      if (repoMatch !== null) {
-        const owner = decodeURIComponent(repoMatch[1]!);
-        const name = decodeURIComponent(repoMatch[2]!);
-        const restPath = repoMatch[3] ?? '';
+      // /repos/:owner/:repo/... — split by hand; the previous version ran ~20 regexes
+      // per request, which the read workload (2,000 sequential GETs) paid in full.
+      if (tail.startsWith('/repos/')) {
+        const afterRepos = tail.slice(7);
+        const ownerEnd = afterRepos.indexOf('/');
+        if (ownerEnd > 0) {
+          const ownerRaw = afterRepos.slice(0, ownerEnd);
+          const afterOwner = afterRepos.slice(ownerEnd + 1);
+          const nameEnd = afterOwner.indexOf('/');
+          const nameRaw = nameEnd < 0 ? afterOwner : afterOwner.slice(0, nameEnd);
+          const restPath = nameEnd < 0 ? '' : afterOwner.slice(nameEnd + 1);
+          if (nameRaw !== '') {
+            const owner = decodeURIComponent(ownerRaw);
+            const name = decodeURIComponent(nameRaw);
 
-        if (restPath === '' && method === 'GET') {
-          sendJson(res, 200, rest.getRepo(ctx, owner, name));
-          return;
-        }
-        if (restPath === '' && method === 'PATCH') {
-          const body = await readJsonBody(req);
-          sendJson(res, 200, rest.patchRepo(ctx, owner, name, body));
-          return;
-        }
-        if (restPath === '' && method === 'DELETE') {
-          rest.deleteRepo(ctx, owner, name);
-          res.writeHead(204, { 'X-GitHub-Request-Id': nextRequestId() });
-          res.end();
-          return;
-        }
-
-        if (restPath === 'git/refs' && method === 'POST') {
-          const body = await readJsonBody(req);
-          const { status, json } = rest.createRef(ctx, owner, name, body);
-          sendJson(res, status, json);
-          return;
-        }
-        const refMatch = /^git\/refs\/(.+)$/.exec(restPath);
-        if (refMatch !== null && method === 'GET') {
-          sendJson(res, 200, rest.getRef(ctx, owner, name, decodeURIComponent(refMatch[1]!)));
-          return;
-        }
-
-        if (restPath === 'branches' && method === 'GET') {
-          sendJson(res, 200, rest.listBranches(ctx, owner, name));
-          return;
-        }
-        const branchMatch = /^branches\/(.+)$/.exec(restPath);
-        if (branchMatch !== null && method === 'GET') {
-          sendJson(res, 200, rest.getBranch(ctx, owner, name, decodeURIComponent(branchMatch[1]!)));
-          return;
-        }
-
-        if (restPath === 'commits' && method === 'GET') {
-          sendJson(res, 200, rest.listCommits(ctx, owner, name));
-          return;
-        }
-
-        const contentsMatch = /^contents\/(.*)$/.exec(restPath);
-        if (contentsMatch !== null && method === 'GET') {
-          sendJson(res, 200, rest.getContents(ctx, owner, name, decodeURIComponent(contentsMatch[1]!)));
-          return;
-        }
-        if (contentsMatch !== null && method === 'PUT') {
-          const body = await readJsonBody(req);
-          const { status, json } = rest.putContents(ctx, owner, name, decodeURIComponent(contentsMatch[1]!), body);
-          sendJson(res, status, json);
-          return;
-        }
-        if (contentsMatch !== null && method === 'DELETE') {
-          const body = await readJsonBody(req);
-          sendJson(res, 200, rest.deleteContents(ctx, owner, name, decodeURIComponent(contentsMatch[1]!), body));
-          return;
-        }
-
-        if (restPath === 'labels' && method === 'POST') {
-          const body = await readJsonBody(req);
-          const { status, json } = rest.createLabel(ctx, owner, name, body);
-          sendJson(res, status, json);
-          return;
-        }
-        if (restPath === 'labels' && method === 'GET') {
-          sendJson(res, 200, rest.listLabels(ctx, owner, name));
-          return;
-        }
-
-        if (restPath === 'issues' && method === 'POST') {
-          const body = await readJsonBody(req);
-          const { status, json } = rest.createIssue(ctx, owner, name, body);
-          sendJson(res, status, json);
-          return;
-        }
-        if (restPath === 'issues' && method === 'GET') {
-          sendJson(res, 200, rest.listIssues(ctx, owner, name));
-          return;
-        }
-        const issueCommentsMatch = /^issues\/(\d+)\/comments$/.exec(restPath);
-        if (issueCommentsMatch !== null && method === 'POST') {
-          const body = await readJsonBody(req);
-          const { status, json } = rest.createComment(ctx, owner, name, Number(issueCommentsMatch[1]), body);
-          sendJson(res, status, json);
-          return;
-        }
-        if (issueCommentsMatch !== null && method === 'GET') {
-          sendJson(res, 200, rest.listComments(ctx, owner, name, Number(issueCommentsMatch[1])));
-          return;
-        }
-        const issueMatch = /^issues\/(\d+)$/.exec(restPath);
-        if (issueMatch !== null && method === 'GET') {
-          sendJson(res, 200, rest.getIssue(ctx, owner, name, Number(issueMatch[1])));
-          return;
-        }
-        if (issueMatch !== null && method === 'PATCH') {
-          const body = await readJsonBody(req);
-          sendJson(res, 200, rest.patchIssue(ctx, owner, name, Number(issueMatch[1]), body));
-          return;
-        }
-
-        if (restPath === 'pulls' && method === 'POST') {
-          const body = await readJsonBody(req);
-          const { status, json } = rest.createPull(ctx, owner, name, body);
-          sendJson(res, status, json);
-          return;
-        }
-        if (restPath === 'pulls' && method === 'GET') {
-          sendJson(res, 200, rest.listPulls(ctx, owner, name));
-          return;
-        }
-        const pullFilesMatch = /^pulls\/(\d+)\/files$/.exec(restPath);
-        if (pullFilesMatch !== null && method === 'GET') {
-          sendJson(res, 200, rest.listPullFiles(ctx, owner, name, Number(pullFilesMatch[1])));
-          return;
-        }
-        const pullMergeMatch = /^pulls\/(\d+)\/merge$/.exec(restPath);
-        if (pullMergeMatch !== null && method === 'PUT') {
-          const body = await readJsonBody(req);
-          sendJson(res, 200, rest.mergePull(ctx, owner, name, Number(pullMergeMatch[1]), body));
-          return;
-        }
-        const pullMatch = /^pulls\/(\d+)$/.exec(restPath);
-        if (pullMatch !== null && method === 'GET') {
-          sendJson(res, 200, rest.getPull(ctx, owner, name, Number(pullMatch[1])));
-          return;
+            if (restPath === '') {
+              if (method === 'GET') {
+                sendJson(res, 200, rest.getRepo(ctx, owner, name));
+                return;
+              }
+              if (method === 'PATCH') {
+                const body = await readJsonBody(req);
+                sendJson(res, 200, rest.patchRepo(ctx, owner, name, body));
+                return;
+              }
+              if (method === 'DELETE') {
+                rest.deleteRepo(ctx, owner, name);
+                res.writeHead(204, { 'X-GitHub-Request-Id': nextRequestId() });
+                res.end();
+                return;
+              }
+            } else if (restPath === 'git/refs') {
+              if (method === 'POST') {
+                const body = await readJsonBody(req);
+                const { status, json } = rest.createRef(ctx, owner, name, body);
+                sendJson(res, status, json);
+                return;
+              }
+            } else if (restPath.startsWith('git/refs/')) {
+              const refPath = restPath.slice(9);
+              if (refPath !== '' && method === 'GET') {
+                sendJson(res, 200, rest.getRef(ctx, owner, name, decodeURIComponent(refPath)));
+                return;
+              }
+            } else if (restPath === 'branches') {
+              if (method === 'GET') {
+                sendJson(res, 200, rest.listBranches(ctx, owner, name));
+                return;
+              }
+            } else if (restPath.startsWith('branches/')) {
+              const branch = restPath.slice(9);
+              if (branch !== '' && method === 'GET') {
+                sendJson(res, 200, rest.getBranch(ctx, owner, name, decodeURIComponent(branch)));
+                return;
+              }
+            } else if (restPath === 'commits') {
+              if (method === 'GET') {
+                sendJson(res, 200, rest.listCommits(ctx, owner, name));
+                return;
+              }
+            } else if (restPath.startsWith('contents/')) {
+              const contentPath = decodeURIComponent(restPath.slice(9));
+              if (method === 'GET') {
+                sendJson(res, 200, rest.getContents(ctx, owner, name, contentPath));
+                return;
+              }
+              if (method === 'PUT') {
+                const body = await readJsonBody(req);
+                const { status, json } = rest.putContents(ctx, owner, name, contentPath, body);
+                sendJson(res, status, json);
+                return;
+              }
+              if (method === 'DELETE') {
+                const body = await readJsonBody(req);
+                sendJson(res, 200, rest.deleteContents(ctx, owner, name, contentPath, body));
+                return;
+              }
+            } else if (restPath === 'labels') {
+              if (method === 'POST') {
+                const body = await readJsonBody(req);
+                const { status, json } = rest.createLabel(ctx, owner, name, body);
+                sendJson(res, status, json);
+                return;
+              }
+              if (method === 'GET') {
+                sendJson(res, 200, rest.listLabels(ctx, owner, name));
+                return;
+              }
+            } else if (restPath === 'issues') {
+              if (method === 'POST') {
+                const body = await readJsonBody(req);
+                const { status, buffer } = rest.createIssueBuffer(ctx, owner, name, body);
+                sendBytes(res, status, JSON_TYPE, buffer);
+                return;
+              }
+              if (method === 'GET') {
+                sendJson(res, 200, rest.listIssues(ctx, owner, name));
+                return;
+              }
+            } else if (restPath.startsWith('issues/')) {
+              const afterIssues = restPath.slice(7);
+              const slashAt = afterIssues.indexOf('/');
+              if (slashAt < 0) {
+                if (isDigits(afterIssues)) {
+                  const number = Number(afterIssues);
+                  if (method === 'GET') {
+                    sendBytes(res, 200, JSON_TYPE, rest.getIssueBuffer(ctx, owner, name, number));
+                    return;
+                  }
+                  if (method === 'PATCH') {
+                    const body = await readJsonBody(req);
+                    sendJson(res, 200, rest.patchIssue(ctx, owner, name, number, body));
+                    return;
+                  }
+                }
+              } else if (isDigits(afterIssues.slice(0, slashAt)) && afterIssues.slice(slashAt + 1) === 'comments') {
+                const number = Number(afterIssues.slice(0, slashAt));
+                if (method === 'POST') {
+                  const body = await readJsonBody(req);
+                  const { status, json } = rest.createComment(ctx, owner, name, number, body);
+                  sendJson(res, status, json);
+                  return;
+                }
+                if (method === 'GET') {
+                  sendJson(res, 200, rest.listComments(ctx, owner, name, number));
+                  return;
+                }
+              }
+            } else if (restPath === 'pulls') {
+              if (method === 'POST') {
+                const body = await readJsonBody(req);
+                const { status, json } = rest.createPull(ctx, owner, name, body);
+                sendJson(res, status, json);
+                return;
+              }
+              if (method === 'GET') {
+                sendJson(res, 200, rest.listPulls(ctx, owner, name));
+                return;
+              }
+            } else if (restPath.startsWith('pulls/')) {
+              const afterPulls = restPath.slice(6);
+              const slashAt = afterPulls.indexOf('/');
+              if (slashAt < 0) {
+                if (isDigits(afterPulls) && method === 'GET') {
+                  sendJson(res, 200, rest.getPull(ctx, owner, name, Number(afterPulls)));
+                  return;
+                }
+              } else if (isDigits(afterPulls.slice(0, slashAt))) {
+                const number = Number(afterPulls.slice(0, slashAt));
+                const sub = afterPulls.slice(slashAt + 1);
+                if (sub === 'files' && method === 'GET') {
+                  sendJson(res, 200, rest.listPullFiles(ctx, owner, name, number));
+                  return;
+                }
+                if (sub === 'merge' && method === 'PUT') {
+                  const body = await readJsonBody(req);
+                  sendJson(res, 200, rest.mergePull(ctx, owner, name, number, body));
+                  return;
+                }
+              }
+            }
+          }
         }
       }
 

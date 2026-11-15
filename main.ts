@@ -1,8 +1,14 @@
 // main.ts — entry point: build the store, bind an ephemeral port, register with the
 // trial environment, and stay alive until the environment reports done.
 
+import { Agent as HttpAgent, get as httpGet } from 'node:http';
+import { Agent as HttpsAgent, get as httpsGet } from 'node:https';
 import { createApp } from './app.ts';
 import { Store } from './store.ts';
+
+/** One keep-alive agent per scheme, so the /done poll reuses its socket. */
+const httpKeepAlive = new HttpAgent({ keepAlive: true });
+const httpsKeepAlive = new HttpsAgent({ keepAlive: true });
 
 const envUrl = process.env.MAKEFUN_ENV_URL;
 if (envUrl === undefined || envUrl === '') {
@@ -27,14 +33,29 @@ async function postJson(url: string, body: unknown): Promise<{ status: number; t
 }
 
 async function getJson(url: string): Promise<{ status: number; body: unknown }> {
-  const response = await fetch(url, { method: 'GET' });
-  let body: unknown = null;
-  try {
-    body = await response.json();
-  } catch {
-    body = null;
-  }
-  return { status: response.status, body };
+  // Plain node:http(s) on a keep-alive agent, not fetch: waitDone polls /done every
+  // 250 ms for the whole trial, and undici's fetch pays proxy-agent resolution and a
+  // fresh dispatcher path on every poll — CPU the timed workloads then lose.
+  const isHttps = url.startsWith('https:');
+  const getter = isHttps ? httpsGet : httpGet;
+  return new Promise((resolve, reject) => {
+    const req = getter(url, { agent: isHttps ? httpsKeepAlive : httpKeepAlive }, (res) => {
+      const chunks: Buffer[] = [];
+      res.on('data', (chunk: Buffer) => chunks.push(chunk));
+      res.on('end', () => {
+        let body: unknown = null;
+        try {
+          body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        } catch {
+          body = null;
+        }
+        resolve({ status: res.statusCode ?? 0, body });
+      });
+      res.on('error', reject);
+    });
+    req.on('error', reject);
+    req.setTimeout(2000, () => req.destroy(new Error('poll timed out')));
+  });
 }
 
 async function register(port: number): Promise<void> {

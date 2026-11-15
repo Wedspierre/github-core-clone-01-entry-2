@@ -3,9 +3,9 @@
 
 import {
   VIEWER,
+  commitOf,
   flattenTree,
   isOid,
-  parseCommit,
   parseTree,
   type Issue,
   type Label,
@@ -84,7 +84,7 @@ export function repoJson(repo: Repo): Record<string, unknown> {
 export function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
   return {
     id: issue.id,
-    node_id: Buffer.from(`issue:${repo.id}:${issue.number}`, 'utf8').toString('base64url'),
+    node_id: issue.nodeId,
     number: issue.number,
     title: issue.title,
     body: issue.body,
@@ -126,9 +126,8 @@ export function pullJson(repo: Repo, pull: PullRequest): Record<string, unknown>
 }
 
 function commitJson(repo: Repo, sha: string): Record<string, unknown> | null {
-  const object = repo.objects.get(sha);
-  if (!object || object.type !== 'commit') return null;
-  const commit = parseCommit(object.data);
+  const commit = commitOf(repo, sha);
+  if (!commit) return null;
   const who = (line: string): { name: string; email: string; date: string } => {
     const match = /^(.*) <(.*)> (\d+) ([+-]\d+)$/.exec(line);
     if (!match) return { name: VIEWER.name, email: VIEWER.email, date: repo.createdAt };
@@ -299,8 +298,8 @@ export function getContents(ctx: Ctx, owner: string, name: string, path: string)
   const ref = ctx.query.get('ref');
   const tip = ref === null ? repo.refs.get(`refs/heads/${repo.defaultBranch}`) : ctx.store.resolveRef(repo, ref);
   if (tip === undefined) throw err(404, 'Not Found');
-  const commit = parseCommit(repo.objects.get(tip)!.data);
-  const files = flattenTree(commit.tree, (oid) => repo.objects.get(oid));
+  const commit = commitOf(repo, tip)!;
+  const files = flattenTree(commit.tree, (oid) => repo.objects.get(oid), '', new Map(), repo);
   if (path === '') {
     // The repository root: list top-level entries.
     const seen = new Map<string, { type: string; sha: string }>();
@@ -382,9 +381,9 @@ export function putContents(
     if (tip !== undefined) repo.refs.set(`refs/heads/${branch}`, tip);
   }
   const tip = repo.refs.get(`refs/heads/${branch}`);
-  const isUpdate = tip !== undefined && flattenTree(parseCommit(repo.objects.get(tip)!.data).tree, (oid) => repo.objects.get(oid)).has(path);
+  const isUpdate = tip !== undefined && flattenTree(commitOf(repo, tip)!.tree, (oid) => repo.objects.get(oid), '', new Map(), repo).has(path);
   if (isUpdate) {
-    const files = flattenTree(parseCommit(repo.objects.get(tip!)!.data).tree, (oid) => repo.objects.get(oid));
+    const files = flattenTree(commitOf(repo, tip!)!.tree, (oid) => repo.objects.get(oid), '', new Map(), repo);
     const currentSha = files.get(path)!;
     if (typeof body.sha === 'string' && body.sha !== '' && body.sha.toLowerCase() !== currentSha.toLowerCase()) {
       throw err(409, 'sha does not match the current file');
@@ -487,6 +486,38 @@ export function getIssue(ctx: Ctx, owner: string, name: string, number: number):
   return issueJson(repo, issue);
 }
 
+/** The serialised GET-issue body, cached per issue (invalidated on any mutation of it). */
+export function issueJsonBuffer(repo: Repo, issue: Issue): Buffer {
+  const cached = issue.jsonCache;
+  if (cached !== null) return cached;
+  const buffer = Buffer.from(JSON.stringify(issueJson(repo, issue)), 'utf8');
+  issue.jsonCache = buffer;
+  return buffer;
+}
+
+/** GET one issue as a ready-to-send buffer. */
+export function getIssueBuffer(ctx: Ctx, owner: string, name: string, number: number): Buffer {
+  const repo = needRepo(ctx, owner, name);
+  const issue = repo.issuesByNumber.get(number);
+  if (!issue) throw err(404, 'Not Found');
+  return issueJsonBuffer(repo, issue);
+}
+
+/** POST one issue as a ready-to-send buffer (the create path warms the same cache). */
+export function createIssueBuffer(ctx: Ctx, owner: string, name: string, body: Record<string, unknown>): { status: number; buffer: Buffer } {
+  const repo = needRepo(ctx, owner, name);
+  const title = typeof body.title === 'string' ? body.title : '';
+  if (title === '') throw err(422, 'title is required');
+  const labels: Label[] = [];
+  for (const labelName of parseIssueLabels(body)) {
+    const label = repo.labels.get(labelName);
+    if (!label) throw err(422, `Label does not exist: ${labelName}`);
+    labels.push(label);
+  }
+  const issue = ctx.store.createIssue(repo, title, typeof body.body === 'string' ? body.body : '', labels);
+  return { status: 201, buffer: issueJsonBuffer(repo, issue) };
+}
+
 export function patchIssue(ctx: Ctx, owner: string, name: string, number: number, body: Record<string, unknown>): Record<string, unknown> {
   const repo = needRepo(ctx, owner, name);
   const issue = repo.issuesByNumber.get(number);
@@ -504,6 +535,7 @@ export function patchIssue(ctx: Ctx, owner: string, name: string, number: number
     issue.labels = labels;
   }
   issue.updatedAt = ctx.store.clock.stamp();
+  issue.jsonCache = null;
   return issueJson(repo, issue);
 }
 

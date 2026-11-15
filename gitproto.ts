@@ -5,11 +5,11 @@
 import {
   ZERO_OID,
   collectReachable,
+  commitOf,
   isOid,
-  parseCommit,
   parseTag,
-  parseTree,
   readPack,
+  treeOf,
   writePack,
   type GitObject,
   type Repo,
@@ -127,15 +127,18 @@ export function advertiseV0(repo: Repo, service: 'git-upload-pack' | 'git-receiv
 }
 
 /** The protocol v2 capability advertisement body for upload-pack. */
+const ADVERTISE_V2 = pktLines([
+  'version 2\n',
+  'ls-refs=unborn\n',
+  'fetch=shallow filter\n',
+  'object-format=sha1\n',
+  `agent=${AGENT}\n`,
+  'flush',
+]);
+
+/** The protocol v2 capability advertisement body for upload-pack (constant bytes). */
 export function advertiseV2(): Buffer {
-  return pktLines([
-    'version 2\n',
-    'ls-refs=unborn\n',
-    'fetch=shallow filter\n',
-    'object-format=sha1\n',
-    `agent=${AGENT}\n`,
-    'flush',
-  ]);
+  return ADVERTISE_V2;
 }
 
 /** One sideband packet: band 1 is pack data, band 2 progress, band 3 an error. */
@@ -267,7 +270,8 @@ function heldObjects(repo: Repo, haves: Set<string>, shallow: Set<string>): Set<
     if (!object) return;
     held.add(oid);
     if (object.type === 'commit') {
-      const commit = parseCommit(object.data);
+      const commit = commitOf(repo, oid);
+      if (!commit) return;
       walk(commit.tree);
       if (!shallow.has(oid)) {
         for (const parent of commit.parents) walk(parent);
@@ -275,7 +279,7 @@ function heldObjects(repo: Repo, haves: Set<string>, shallow: Set<string>): Set<
     } else if (object.type === 'tag') {
       walk(parseTag(object.data).object);
     } else if (object.type === 'tree') {
-      for (const entry of parseTree(object.data)) {
+      for (const entry of treeOf(repo, oid) ?? []) {
         if (entry.mode !== '160000') walk(entry.oid);
       }
     }
@@ -295,11 +299,7 @@ function heldObjects(repo: Repo, haves: Set<string>, shallow: Set<string>): Set<
  */
 export function planFetch(repo: Repo, args: FetchArgs): FetchPlan {
   const lookup = (oid: string): GitObject | undefined => repo.objects.get(oid);
-  const commitParents = (oid: string): string[] => {
-    const object = repo.objects.get(oid);
-    if (!object || object.type !== 'commit') return [];
-    return parseCommit(object.data).parents;
-  };
+  const commitParents = (oid: string): string[] => commitOf(repo, oid)?.parents ?? [];
   const wantSet = new Set(args.wants.filter((oid) => isOid(oid) && repo.objects.has(oid)));
   const haveSet = new Set(args.haves.filter((oid) => isOid(oid)));
   const oldShallow = new Set(args.shallow.filter((oid) => isOid(oid)));
@@ -447,7 +447,8 @@ export function planFetch(repo: Repo, args: FetchArgs): FetchPlan {
       if (!object) return;
       objects.set(oid, object);
       if (object.type === 'commit') {
-        const commit = parseCommit(object.data);
+        const commit = commitOf(repo, oid);
+        if (!commit) return;
         include(commit.tree);
         for (const parent of commit.parents) {
           if (sendCommits.has(parent)) include(parent);
@@ -455,7 +456,7 @@ export function planFetch(repo: Repo, args: FetchArgs): FetchPlan {
       } else if (object.type === 'tag') {
         include(parseTag(object.data).object);
       } else if (object.type === 'tree') {
-        for (const entry of parseTree(object.data)) {
+        for (const entry of treeOf(repo, oid) ?? []) {
           if (entry.mode !== '160000') include(entry.oid);
         }
       }
@@ -479,6 +480,24 @@ export function packOf(objects: GitObject[]): Buffer {
 
 /** Answer a v2 fetch command. */
 export function fetchV2Response(repo: Repo, args: FetchArgs): Buffer {
+  // Identical no-have fetches always produce identical bytes: the objects a fetch
+  // sends are fixed by the wanted oids, the depth and the filter, and stored objects
+  // are immutable — the object count pins the store's growth, so a later push that
+  // adds objects changes the key. The clone workload issues ~155 such fetches of
+  // one tip; building the pack once serves them all.
+  if (args.haves.length === 0) {
+    const key = `v2|${repo.objects.size}|${args.wants.join(',')}|${args.deepen}|${args.filter ?? ''}`;
+    const cached = repo.fetchCache.get(key);
+    if (cached !== undefined) return cached;
+    const built = buildFetchV2Response(repo, args);
+    if (repo.fetchCache.size >= 32) repo.fetchCache.clear();
+    repo.fetchCache.set(key, built);
+    return built;
+  }
+  return buildFetchV2Response(repo, args);
+}
+
+function buildFetchV2Response(repo: Repo, args: FetchArgs): Buffer {
   const plan = planFetch(repo, args);
   const parts: Buffer[] = [];
   // The acknowledgments section only exists when the client sent at least one
@@ -508,6 +527,19 @@ export function fetchV2Response(repo: Repo, args: FetchArgs): Buffer {
 
 /** Answer a v0 fetch command (NAK, shallow lines, then the sideband pack). */
 export function fetchV0Response(repo: Repo, args: FetchArgs): Buffer {
+  if (args.haves.length === 0) {
+    const key = `v0|${repo.objects.size}|${args.wants.join(',')}|${args.deepen}|${args.filter ?? ''}`;
+    const cached = repo.fetchCache.get(key);
+    if (cached !== undefined) return cached;
+    const built = buildFetchV0Response(repo, args);
+    if (repo.fetchCache.size >= 32) repo.fetchCache.clear();
+    repo.fetchCache.set(key, built);
+    return built;
+  }
+  return buildFetchV0Response(repo, args);
+}
+
+function buildFetchV0Response(repo: Repo, args: FetchArgs): Buffer {
   const plan = planFetch(repo, args);
   const parts: Buffer[] = [];
   parts.push(pktLine('NAK\n'));
