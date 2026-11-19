@@ -1,508 +1,299 @@
-// app.ts — the HTTP server: routing, Bearer auth, JSON bodies, and the response
-// envelope (JSON content type + X-GitHub-Request-Id on every reply). It binds nothing
-// itself; main.ts owns the lifecycle.
+// app.ts — github-core-clone-01 v3 forge: the HTTP server and router.
+//
+// Written from scratch for the v3 perf rebuild. One node:http server, no
+// framework: manual routing, sync handlers over the in-memory store, cached
+// Buffers on the hot paths, keep-alive throughout.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { VIEWER, type Store } from './store.ts';
+import { handleRest, type RestReply } from './rest.ts';
+import { executeGraphQL } from './graphql.ts';
+import { handleMcp } from './mcp.ts';
 import {
-  advertiseV0,
-  advertiseV2,
+  advertisementV0Receive,
+  advertisementV0Upload,
+  advertisementV2,
   applyPush,
-  fetchV0Response,
-  fetchV2Response,
+  fetchResponse,
   lsRefsResponse,
-  parseFetchV0,
-  parseFetchV2,
+  parseFetch,
   parseLsRefs,
-  parseReceivePack,
-  pushReportResponse,
-  v2Command,
+  parsePush,
+  pushResponse,
 } from './gitproto.ts';
-import * as rest from './rest.ts';
-import { executeGraphql } from './graphql.ts';
-import { handleMcpBody } from './mcp.ts';
+import { getIssue, getRepo, issueJson } from './store.ts';
 
+const TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+const EXPECTED_AUTH = TOKEN === '' ? '' : `Bearer ${TOKEN}`;
 const JSON_TYPE = 'application/json; charset=utf-8';
 
-/** True when `text` is a non-empty run of ASCII digits (a REST issue/pull number). */
-function isDigits(text: string): boolean {
-  if (text === '') return false;
-  for (let index = 0; index < text.length; index += 1) {
-    const code = text.charCodeAt(index);
-    if (code < 48 || code > 57) return false;
-  }
-  return true;
+let reqSeq = 0;
+
+function authed(req: IncomingMessage): boolean {
+  const h = req.headers.authorization;
+  if (typeof h !== 'string') return false;
+  if (EXPECTED_AUTH === '') return h.startsWith('Bearer ') && h.length > 7;
+  return h === EXPECTED_AUTH;
 }
 
-export function createApp(store: Store): Server {
-  let requestCounter = 0;
-
-  const server = createServer((req, res) => {
-    void handleRequest(req, res).catch((err: unknown) => {
-      // A handler that throws after headers were sent cannot be answered; log and drop.
-      if (!res.headersSent) sendJson(res, 500, { message: err instanceof Error ? err.message : String(err) });
-    });
-  });
-
-  function nextRequestId(): string {
-    requestCounter += 1;
-    return `req-${requestCounter}`;
+function send(res: ServerResponse, status: number, body: Buffer, contentType: string, extra?: Record<string, string>): void {
+  const headers: Record<string, string | number> = {
+    'content-type': contentType,
+    'content-length': body.length,
+    'x-github-request-id': `r${++reqSeq}`,
+  };
+  if (extra !== undefined) {
+    for (const k of Object.keys(extra)) headers[k] = extra[k];
   }
+  res.writeHead(status, headers);
+  res.end(body);
+}
 
-  function sendJson(res: ServerResponse, status: number, body: unknown, extraHeaders: Record<string, string> = {}): void {
-    const payload = Buffer.from(JSON.stringify(body), 'utf8');
-    res.writeHead(status, {
-      'Content-Type': JSON_TYPE,
-      'X-GitHub-Request-Id': nextRequestId(),
-      'Content-Length': payload.length,
-      ...extraHeaders,
-    });
-    res.end(payload);
+function sendJson(res: ServerResponse, status: number, value: unknown, extra?: Record<string, string>): void {
+  send(res, status, Buffer.from(JSON.stringify(value), 'utf8'), JSON_TYPE, extra);
+}
+
+function sendErr(res: ServerResponse, status: number, message: string): void {
+  sendJson(res, status, { message });
+}
+
+async function readBody(req: IncomingMessage): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) chunks.push(chunk as Buffer);
+  if (chunks.length === 0) return Buffer.alloc(0);
+  if (chunks.length === 1) return chunks[0];
+  return Buffer.concat(chunks);
+}
+
+function decodeSeg(seg: string): string {
+  if (seg.indexOf('%') < 0) return seg;
+  try {
+    return decodeURIComponent(seg);
+  } catch {
+    return seg;
   }
+}
 
-  function sendBytes(res: ServerResponse, status: number, contentType: string, body: Buffer): void {
-    res.writeHead(status, {
-      'Content-Type': contentType,
-      'X-GitHub-Request-Id': nextRequestId(),
-      'Content-Length': body.length,
-    });
-    res.end(body);
-  }
+async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const method = req.method ?? 'GET';
+  const rawUrl = req.url ?? '/';
+  const q = rawUrl.indexOf('?');
+  const pathname = q < 0 ? rawUrl : rawUrl.slice(0, q);
+  const queryString = q < 0 ? '' : rawUrl.slice(q + 1);
 
-  function readBody(req: IncomingMessage): Promise<Buffer> {
-    return new Promise((resolve, reject) => {
-      const chunks: Buffer[] = [];
-      req.on('data', (chunk: Buffer) => chunks.push(chunk));
-      req.on('end', () => resolve(Buffer.concat(chunks)));
-      req.on('error', reject);
-    });
-  }
-
-  async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
-    const raw = await readBody(req);
-    if (raw.length === 0) return {};
-    try {
-      const parsed: unknown = JSON.parse(raw.toString('utf8'));
-      if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed as Record<string, unknown>;
-      return {};
-    } catch {
-      throw new rest.HttpError(400, 'Malformed JSON body');
-    }
-  }
-
-  /** The Bearer check. A missing/wrong token is a 401 with a JSON message. */
-  function authorized(req: IncomingMessage): boolean {
-    const expected = process.env.MAKEFUN_SHOP_TOKEN ?? '';
-    const header = req.headers.authorization ?? '';
-    if (!header.startsWith('Bearer ')) return false;
-    const token = header.slice(7);
-    if (expected === '') return token.length > 0;
-    return token === expected;
-  }
-
-  async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    const url = new URL(req.url ?? '/', 'http://localhost');
-    const path = url.pathname;
-    const method = req.method ?? 'GET';
-    const host = req.headers.host ?? 'localhost';
-
-    // --- health, no auth ---
-    if (path === '/healthz') {
-      sendJson(res, 200, { ok: true });
-      return;
-    }
-
-    // --- git smart HTTP ---
-    // /<owner>/<repo>.git/<suffix>, parsed by hand: the regex this replaced ran on
-    // every git request, and push/clone workloads issue hundreds of them.
-    const gitIdx = path.lastIndexOf('.git/');
-    if (gitIdx > 1) {
-      const prefix = path.slice(1, gitIdx);
-      const slash = prefix.indexOf('/');
-      if (slash > 0 && prefix.indexOf('/', slash + 1) < 0) {
-        const owner = prefix.slice(0, slash);
-        const repoName = prefix.slice(slash + 1);
-        const suffix = path.slice(gitIdx + 5);
-        if (owner !== '' && repoName !== '' && suffix !== '') {
-          await handleGit(req, res, owner, repoName, suffix, url);
+  // The read workload's hot path: GET /api/v3/repos/{owner}/{repo}/issues/{n}.
+  if (method === 'GET' && pathname.startsWith('/api/v3/repos/')) {
+    const parts = pathname.slice('/api/v3/repos/'.length).split('/');
+    if (parts.length === 4 && parts[2] === 'issues') {
+      const num = Number(parts[3]);
+      if (Number.isInteger(num) && num > 0) {
+        if (!authed(req)) {
+          sendErr(res, 401, 'Unauthorized');
           return;
         }
-      }
-    }
-
-    // --- API surface: everything below needs a valid token ---
-    if (path.startsWith('/api/v3') || path === '/api/graphql' || path === '/mcp') {
-      if (!authorized(req)) {
-        sendJson(res, 401, { message: 'Bad credentials' });
+        const repo = getRepo(decodeSeg(parts[0]), decodeSeg(parts[1]));
+        if (repo === undefined) {
+          sendErr(res, 404, 'Not Found');
+          return;
+        }
+        const issue = getIssue(repo, num);
+        if (issue === undefined) {
+          sendErr(res, 404, 'Not Found');
+          return;
+        }
+        send(res, 200, issueJson(repo, issue), JSON_TYPE);
         return;
       }
     }
-
-    if (path === '/api/v3/' || path === '/api/v3') {
-      sendJson(res, 200, {}, { 'X-OAuth-Scopes': 'repo, read:org' });
-      return;
-    }
-    if (path === '/api/v3/meta' && method === 'GET') {
-      sendJson(res, 200, { installed_version: '1.0.0' });
-      return;
-    }
-    if (path === '/api/v3/user' && method === 'GET') {
-      sendJson(res, 200, {
-        login: VIEWER.login,
-        id: VIEWER.id,
-        name: VIEWER.name,
-        email: VIEWER.email,
-        type: 'User',
-        site_admin: false,
-      });
-      return;
-    }
-
-    if (path.startsWith('/api/v3')) {
-      await handleRest(req, res, path, method, url, host);
-      return;
-    }
-
-    if (path === '/api/graphql' && method === 'POST') {
-      await handleGraphql(req, res);
-      return;
-    }
-
-    if (path === '/mcp' && method === 'POST') {
-      const raw = await readBody(req);
-      const { status, body } = handleMcpBody(store, raw);
-      if (body === null) {
-        sendJson(res, 200, {});
-        return;
-      }
-      sendJson(res, status, body);
-      return;
-    }
-    if (path === '/mcp' && method === 'DELETE') {
-      sendJson(res, 200, {});
-      return;
-    }
-
-    sendJson(res, 404, { message: 'Not Found' });
   }
 
-  // -------------------------------------------------------------------------------------------
-  // git
-  // -------------------------------------------------------------------------------------------
+  // Bodies are read (and discarded when refused) before any refusal, so a
+  // keep-alive socket is never left with unread bytes.
+  const needsBody = method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE';
+  const body = needsBody ? await readBody(req) : Buffer.alloc(0);
+  const query = new URLSearchParams(queryString);
 
-  async function handleGit(
-    req: IncomingMessage,
-    res: ServerResponse,
-    owner: string,
-    repoName: string,
-    suffix: string,
-    url: URL,
-  ): Promise<void> {
-    const method = req.method ?? 'GET';
-    if (!authorized(req)) {
-      sendJson(res, 401, { message: 'Bad credentials' });
+  // Health probe (the env's boot check): no auth.
+  if (method === 'GET' && pathname === '/healthz') {
+    sendJson(res, 200, { ok: true });
+    return;
+  }
+
+  const segs = pathname.split('/').filter((s) => s !== '');
+
+  // Git smart HTTP: /{owner}/{repo}.git/...
+  if (segs.length >= 2 && segs[1].endsWith('.git')) {
+    const owner = decodeSeg(segs[0]);
+    const repoName = decodeSeg(segs[1].slice(0, -4));
+    const repo = getRepo(owner, repoName);
+    if (!authed(req)) {
+      sendErr(res, 401, 'Unauthorized');
       return;
     }
-    if (owner !== VIEWER.login) {
-      sendJson(res, 404, { message: 'Not Found' });
-      return;
-    }
-    const repo = store.getRepo(owner, repoName);
     if (repo === undefined) {
-      sendJson(res, 404, { message: 'Not Found' });
+      sendErr(res, 404, 'Not Found');
       return;
     }
-
-    if (suffix === 'info/refs' && method === 'GET') {
-      const service = url.searchParams.get('service');
+    const tail = segs.slice(2).join('/');
+    if (method === 'GET' && tail === 'info/refs') {
+      const service = query.get('service') ?? '';
       if (service === 'git-upload-pack') {
         const v2 = (req.headers['git-protocol'] ?? '') === 'version=2';
-        sendBytes(res, 200, 'application/x-git-upload-pack-advertisement', v2 ? advertiseV2() : advertiseV0(repo, 'git-upload-pack'));
+        const ad = v2 ? advertisementV2(repo) : advertisementV0Upload(repo);
+        send(res, 200, ad, 'application/x-git-upload-pack-advertisement');
         return;
       }
       if (service === 'git-receive-pack') {
-        sendBytes(res, 200, 'application/x-git-receive-pack-advertisement', advertiseV0(repo, 'git-receive-pack'));
+        send(res, 200, advertisementV0Receive(repo), 'application/x-git-receive-pack-advertisement');
         return;
       }
-      sendJson(res, 400, { message: 'service is required' });
+      sendErr(res, 400, 'unknown service');
       return;
     }
-
-    if (suffix === 'git-upload-pack' && method === 'POST') {
-      const body = await readBody(req);
+    if (method === 'POST' && tail === 'git-upload-pack') {
       try {
-        if ((req.headers['git-protocol'] ?? '') === 'version=2') {
-          const command = v2Command(body);
-          if (command === 'ls-refs') {
-            sendBytes(res, 200, 'application/x-git-upload-pack-result', lsRefsResponse(repo, parseLsRefs(body)));
-            return;
-          }
-          if (command === 'fetch') {
-            sendBytes(res, 200, 'application/x-git-upload-pack-result', fetchV2Response(repo, parseFetchV2(body)));
-            return;
-          }
-          sendBytes(res, 200, 'application/x-git-upload-pack-result', Buffer.alloc(0));
+        const ls = parseLsRefs(body);
+        if (ls !== null) {
+          send(res, 200, lsRefsResponse(repo, ls), 'application/x-git-upload-pack-result');
           return;
         }
-        sendBytes(res, 200, 'application/x-git-upload-pack-result', fetchV0Response(repo, parseFetchV0(body)));
-      } catch (err) {
-        sendJson(res, 400, { message: err instanceof Error ? err.message : String(err) });
-      }
-      return;
-    }
-
-    if (suffix === 'git-receive-pack' && method === 'POST') {
-      const body = await readBody(req);
-      try {
-        const { commands, pack } = parseReceivePack(body);
-        const result = applyPush(store, repo, commands, pack);
-        sendBytes(res, 200, 'application/x-git-receive-pack-result', pushReportResponse(result));
-      } catch (err) {
-        sendJson(res, 400, { message: err instanceof Error ? err.message : String(err) });
-      }
-      return;
-    }
-
-    sendJson(res, 404, { message: 'Not Found' });
-  }
-
-  // -------------------------------------------------------------------------------------------
-  // REST v3
-  // -------------------------------------------------------------------------------------------
-
-  async function handleRest(
-    req: IncomingMessage,
-    res: ServerResponse,
-    path: string,
-    method: string,
-    url: URL,
-    host: string,
-  ): Promise<void> {
-    const ctx: rest.Ctx = { store, host, query: url.searchParams };
-    const tail = path.slice('/api/v3'.length);
-    try {
-      // POST /user/repos, GET /user/repos
-      if (tail === '/user/repos') {
-        if (method === 'POST') {
-          const body = await readJsonBody(req);
-          const { status, json } = rest.createUserRepo(ctx, body);
-          sendJson(res, status, json);
+        const fetch = parseFetch(body);
+        if (fetch !== null) {
+          send(res, 200, fetchResponse(repo, fetch), 'application/x-git-upload-pack-result');
           return;
         }
-        if (method === 'GET') {
-          const { status, json, link } = rest.listUserRepos(ctx);
-          sendJson(res, status, json, link !== null ? { Link: link } : {});
-          return;
-        }
-      }
-
-      // /repos/:owner/:repo/... — split by hand; the previous version ran ~20 regexes
-      // per request, which the read workload (2,000 sequential GETs) paid in full.
-      if (tail.startsWith('/repos/')) {
-        const afterRepos = tail.slice(7);
-        const ownerEnd = afterRepos.indexOf('/');
-        if (ownerEnd > 0) {
-          const ownerRaw = afterRepos.slice(0, ownerEnd);
-          const afterOwner = afterRepos.slice(ownerEnd + 1);
-          const nameEnd = afterOwner.indexOf('/');
-          const nameRaw = nameEnd < 0 ? afterOwner : afterOwner.slice(0, nameEnd);
-          const restPath = nameEnd < 0 ? '' : afterOwner.slice(nameEnd + 1);
-          if (nameRaw !== '') {
-            const owner = decodeURIComponent(ownerRaw);
-            const name = decodeURIComponent(nameRaw);
-
-            if (restPath === '') {
-              if (method === 'GET') {
-                sendJson(res, 200, rest.getRepo(ctx, owner, name));
-                return;
-              }
-              if (method === 'PATCH') {
-                const body = await readJsonBody(req);
-                sendJson(res, 200, rest.patchRepo(ctx, owner, name, body));
-                return;
-              }
-              if (method === 'DELETE') {
-                rest.deleteRepo(ctx, owner, name);
-                res.writeHead(204, { 'X-GitHub-Request-Id': nextRequestId() });
-                res.end();
-                return;
-              }
-            } else if (restPath === 'git/refs') {
-              if (method === 'POST') {
-                const body = await readJsonBody(req);
-                const { status, json } = rest.createRef(ctx, owner, name, body);
-                sendJson(res, status, json);
-                return;
-              }
-            } else if (restPath.startsWith('git/refs/')) {
-              const refPath = restPath.slice(9);
-              if (refPath !== '' && method === 'GET') {
-                sendJson(res, 200, rest.getRef(ctx, owner, name, decodeURIComponent(refPath)));
-                return;
-              }
-            } else if (restPath === 'branches') {
-              if (method === 'GET') {
-                sendJson(res, 200, rest.listBranches(ctx, owner, name));
-                return;
-              }
-            } else if (restPath.startsWith('branches/')) {
-              const branch = restPath.slice(9);
-              if (branch !== '' && method === 'GET') {
-                sendJson(res, 200, rest.getBranch(ctx, owner, name, decodeURIComponent(branch)));
-                return;
-              }
-            } else if (restPath === 'commits') {
-              if (method === 'GET') {
-                sendJson(res, 200, rest.listCommits(ctx, owner, name));
-                return;
-              }
-            } else if (restPath.startsWith('contents/')) {
-              const contentPath = decodeURIComponent(restPath.slice(9));
-              if (method === 'GET') {
-                sendJson(res, 200, rest.getContents(ctx, owner, name, contentPath));
-                return;
-              }
-              if (method === 'PUT') {
-                const body = await readJsonBody(req);
-                const { status, json } = rest.putContents(ctx, owner, name, contentPath, body);
-                sendJson(res, status, json);
-                return;
-              }
-              if (method === 'DELETE') {
-                const body = await readJsonBody(req);
-                sendJson(res, 200, rest.deleteContents(ctx, owner, name, contentPath, body));
-                return;
-              }
-            } else if (restPath === 'labels') {
-              if (method === 'POST') {
-                const body = await readJsonBody(req);
-                const { status, json } = rest.createLabel(ctx, owner, name, body);
-                sendJson(res, status, json);
-                return;
-              }
-              if (method === 'GET') {
-                sendJson(res, 200, rest.listLabels(ctx, owner, name));
-                return;
-              }
-            } else if (restPath === 'issues') {
-              if (method === 'POST') {
-                const body = await readJsonBody(req);
-                const { status, buffer } = rest.createIssueBuffer(ctx, owner, name, body);
-                sendBytes(res, status, JSON_TYPE, buffer);
-                return;
-              }
-              if (method === 'GET') {
-                sendJson(res, 200, rest.listIssues(ctx, owner, name));
-                return;
-              }
-            } else if (restPath.startsWith('issues/')) {
-              const afterIssues = restPath.slice(7);
-              const slashAt = afterIssues.indexOf('/');
-              if (slashAt < 0) {
-                if (isDigits(afterIssues)) {
-                  const number = Number(afterIssues);
-                  if (method === 'GET') {
-                    sendBytes(res, 200, JSON_TYPE, rest.getIssueBuffer(ctx, owner, name, number));
-                    return;
-                  }
-                  if (method === 'PATCH') {
-                    const body = await readJsonBody(req);
-                    sendJson(res, 200, rest.patchIssue(ctx, owner, name, number, body));
-                    return;
-                  }
-                }
-              } else if (isDigits(afterIssues.slice(0, slashAt)) && afterIssues.slice(slashAt + 1) === 'comments') {
-                const number = Number(afterIssues.slice(0, slashAt));
-                if (method === 'POST') {
-                  const body = await readJsonBody(req);
-                  const { status, json } = rest.createComment(ctx, owner, name, number, body);
-                  sendJson(res, status, json);
-                  return;
-                }
-                if (method === 'GET') {
-                  sendJson(res, 200, rest.listComments(ctx, owner, name, number));
-                  return;
-                }
-              }
-            } else if (restPath === 'pulls') {
-              if (method === 'POST') {
-                const body = await readJsonBody(req);
-                const { status, json } = rest.createPull(ctx, owner, name, body);
-                sendJson(res, status, json);
-                return;
-              }
-              if (method === 'GET') {
-                sendJson(res, 200, rest.listPulls(ctx, owner, name));
-                return;
-              }
-            } else if (restPath.startsWith('pulls/')) {
-              const afterPulls = restPath.slice(6);
-              const slashAt = afterPulls.indexOf('/');
-              if (slashAt < 0) {
-                if (isDigits(afterPulls) && method === 'GET') {
-                  sendJson(res, 200, rest.getPull(ctx, owner, name, Number(afterPulls)));
-                  return;
-                }
-              } else if (isDigits(afterPulls.slice(0, slashAt))) {
-                const number = Number(afterPulls.slice(0, slashAt));
-                const sub = afterPulls.slice(slashAt + 1);
-                if (sub === 'files' && method === 'GET') {
-                  sendJson(res, 200, rest.listPullFiles(ctx, owner, name, number));
-                  return;
-                }
-                if (sub === 'merge' && method === 'PUT') {
-                  const body = await readJsonBody(req);
-                  sendJson(res, 200, rest.mergePull(ctx, owner, name, number, body));
-                  return;
-                }
-              }
-            }
-          }
-        }
-      }
-
-      sendJson(res, 404, { message: 'Not Found' });
-    } catch (err) {
-      if (err instanceof rest.HttpError) {
-        sendJson(res, err.status, { message: err.message });
+      } catch {
+        send(res, 400, Buffer.from('bad request', 'utf8'), 'application/x-git-upload-pack-result');
         return;
       }
-      throw err;
+      send(res, 400, Buffer.from('bad request', 'utf8'), 'application/x-git-upload-pack-result');
+      return;
     }
+    if (method === 'POST' && tail === 'git-receive-pack') {
+      const parsed = parsePush(body);
+      if (parsed === null) {
+        send(res, 400, Buffer.from('bad request', 'utf8'), 'application/x-git-receive-pack-result');
+        return;
+      }
+      const result = applyPush(repo, parsed.commands, parsed.pack);
+      send(res, 200, pushResponse(result), 'application/x-git-receive-pack-result');
+      return;
+    }
+    sendErr(res, 404, 'Not Found');
+    return;
   }
 
-  // -------------------------------------------------------------------------------------------
-  // GraphQL
-  // -------------------------------------------------------------------------------------------
-
-  async function handleGraphql(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    const raw = await readBody(req);
+  // GraphQL v4.
+  if (segs.length === 2 && segs[0] === 'api' && segs[1] === 'graphql' && method === 'POST') {
+    if (!authed(req)) {
+      sendErr(res, 401, 'Unauthorized');
+      return;
+    }
     let parsed: unknown;
     try {
-      parsed = JSON.parse(raw.toString('utf8'));
+      parsed = JSON.parse(body.toString('utf8'));
     } catch {
-      sendJson(res, 400, { message: 'Malformed JSON body' });
+      sendErr(res, 400, 'request body is not valid JSON');
       return;
     }
     if (Array.isArray(parsed)) {
-      const results = parsed.map((entry) =>
-        entry !== null && typeof entry === 'object'
-          ? executeGraphql(store, entry as { query?: string; operationName?: string; variables?: Record<string, unknown> })
-          : { data: null, errors: [{ message: 'Invalid operation' }] },
-      );
-      sendJson(res, 200, results);
+      const answers = parsed.map((entry) => {
+        if (typeof entry !== 'object' || entry === null) return { data: null, errors: [{ message: 'Invalid Request' }] };
+        const doc = entry as { query?: unknown; variables?: unknown };
+        if (typeof doc.query !== 'string') return { data: null, errors: [{ message: 'query is required' }] };
+        const vars = (typeof doc.variables === 'object' && doc.variables !== null ? (doc.variables as Record<string, unknown>) : {}) as Record<string, unknown>;
+        return executeGraphQL(doc.query, vars);
+      });
+      sendJson(res, 200, answers);
       return;
     }
-    if (parsed !== null && typeof parsed === 'object') {
-      sendJson(
-        res,
-        200,
-        executeGraphql(store, parsed as { query?: string; operationName?: string; variables?: Record<string, unknown> }),
-      );
+    if (typeof parsed !== 'object' || parsed === null) {
+      sendErr(res, 400, 'request body is not valid JSON');
       return;
     }
-    sendJson(res, 400, { message: 'Malformed JSON body' });
+    const doc = parsed as { query?: unknown; variables?: unknown };
+    if (typeof doc.query !== 'string') {
+      sendErr(res, 400, 'query is required');
+      return;
+    }
+    const vars = (typeof doc.variables === 'object' && doc.variables !== null ? (doc.variables as Record<string, unknown>) : {}) as Record<string, unknown>;
+    sendJson(res, 200, executeGraphQL(doc.query, vars));
+    return;
   }
 
-  return server;
+  // MCP.
+  if (segs.length === 1 && segs[0] === 'mcp' && method === 'POST') {
+    if (!authed(req)) {
+      sendErr(res, 401, 'Unauthorized');
+      return;
+    }
+    const reply = handleMcp(body.toString('utf8'));
+    if (reply.body === '') {
+      res.writeHead(reply.status, { 'x-github-request-id': `r${++reqSeq}` });
+      res.end();
+      return;
+    }
+    send(res, reply.status, Buffer.from(reply.body, 'utf8'), JSON_TYPE);
+    return;
+  }
+
+  // REST v3.
+  if (segs.length >= 1 && segs[0] === 'api' && segs[1] === 'v3') {
+    const restSegs = segs.slice(2);
+    const isPublic = method === 'GET' && (restSegs.length === 0 || (restSegs.length === 1 && restSegs[0] === 'meta'));
+    if (!isPublic && !authed(req)) {
+      sendErr(res, 401, 'Unauthorized');
+      return;
+    }
+    let parsedBody: Record<string, unknown> | null = null;
+    if (needsBody && body.length > 0) {
+      try {
+        const value = JSON.parse(body.toString('utf8'));
+        if (typeof value === 'object' && value !== null && !Array.isArray(value)) parsedBody = value as Record<string, unknown>;
+        else if (value === null) parsedBody = null;
+        else {
+          sendErr(res, 400, 'request body must be a JSON object');
+          return;
+        }
+      } catch {
+        sendErr(res, 400, 'request body is not valid JSON');
+        return;
+      }
+    }
+    const origin = `http://${req.headers.host ?? '127.0.0.1'}`;
+    let reply: RestReply | null;
+    try {
+      reply = handleRest(method, restSegs, query, origin, parsedBody);
+    } catch {
+      sendErr(res, 500, 'Internal Server Error');
+      return;
+    }
+    if (reply === null) {
+      sendErr(res, 404, 'Not Found');
+      return;
+    }
+    if (reply.status === 204) {
+      res.writeHead(204, { 'x-github-request-id': `r${++reqSeq}` });
+      res.end();
+      return;
+    }
+    const out = typeof reply.body === 'string' ? Buffer.from(reply.body, 'utf8') : reply.body;
+    send(res, reply.status, out, reply.contentType, reply.headers);
+    return;
+  }
+
+  sendErr(res, 404, 'Not Found');
+}
+
+/** Build the server. It binds nothing until the caller listens. */
+export function createApp(): Server {
+  return createServer((req: IncomingMessage, res: ServerResponse) => {
+    handle(req, res).catch((err: unknown) => {
+      process.stderr.write(`[app] unhandled: ${err instanceof Error ? err.stack ?? err.message : String(err)}\n`);
+      try {
+        sendErr(res, 500, 'Internal Server Error');
+      } catch {
+        // The socket is already gone; nothing left to do.
+      }
+    });
+  });
 }
